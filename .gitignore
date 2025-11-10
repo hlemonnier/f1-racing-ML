@@ -15,3 +15,4 @@ models/
 # Notebooks / logs
 *.ipynb_checkpoints
 logs/
+poetry.lock

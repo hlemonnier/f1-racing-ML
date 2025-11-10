@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 import fastf1
 import pandas as pd
@@ -17,7 +17,8 @@ from f1ml.io import write_json, write_parquet
 
 console = Console()
 
-SESSION_CODES = ("Q", "R")
+ALLOWED_SESSION_CODES = ("FP1", "FP2", "FP3", "SQ", "SR", "Q", "R")
+DEFAULT_SESSION_CODES = ("FP1", "FP2", "FP3", "SQ", "SR", "Q", "R")
 
 
 @dataclass
@@ -100,13 +101,20 @@ def ingest_weekend(
     round_number: Optional[int] = None,
     event_name: Optional[str] = None,
     cache_dir: Optional[Path] = None,
+    session_codes: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, str]]:
-    """Download qualifying and race data for a weekend and persist to parquet."""
+    """Download FastF1 session data for a weekend and persist to parquet."""
     enable_fastf1_cache(cache_dir)
     summary: Dict[str, Dict[str, str]] = {}
+    requested_codes: Iterable[str] = session_codes or DEFAULT_SESSION_CODES
 
-    for session_code in track(SESSION_CODES, description="Downloading sessions"):
-        session = _resolve_session(season, round_number, event_name, session_code)
+    for session_code in track(list(requested_codes), description="Downloading sessions"):
+        try:
+            session = _resolve_session(season, round_number, event_name, session_code)
+        except Exception as exc:  # FastF1 raises several custom errors; treat all as skip-worthy
+            console.print(f"[yellow]Skipping {session_code}[/yellow]: {exc}")
+            continue
+
         artifact_paths = _build_session_paths(session, session_code, round_number)
 
         laps_df = session.laps.reset_index(drop=True)
@@ -125,5 +133,8 @@ def ingest_weekend(
             "results": str(artifact_paths.results_path),
             "metadata": str(artifact_paths.metadata_path),
         }
+
+    if not summary:
+        raise RuntimeError("No sessions were downloaded. Check the requested sessions or availability.")
 
     return summary
