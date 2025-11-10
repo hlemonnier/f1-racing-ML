@@ -1,0 +1,17 @@
+# Python / Poetry
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Data artifacts
+data/raw/
+data/processed/
+reports/
+models/
+.fastf1_cache/
+
+# Notebooks / logs
+*.ipynb_checkpoints
+logs/

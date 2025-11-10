@@ -1,0 +1,32 @@
+[tool.poetry]
+name = "f1-racing-ml"
+version = "0.1.0"
+description = "Predictive pipeline for F1 race results based on qualifying data and incremental learning."
+authors = ["Hugo Lemonnier"]
+readme = "README.md"
+packages = [{ include = "f1ml", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+fastf1 = "^3.3.4"
+pandas = "^2.2.2"
+numpy = "^2.0.0"
+pyarrow = "^16.1.0"
+scikit-learn = "^1.5.0"
+lightgbm = "^4.3.0"
+scipy = "^1.13.1"
+click = "^8.1.7"
+rich = "^13.7.1"
+shap = "^0.45.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.2"
+black = "^24.4.2"
+ruff = "^0.4.8"
+
+[tool.poetry.scripts]
+f1ml = "f1ml.cli:run"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
