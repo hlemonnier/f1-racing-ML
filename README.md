@@ -49,4 +49,10 @@ Pipeline that ingests F1 qualifying/race data via FastF1, engineers features, tr
    ```
    This loops through each round, pulls the requested sessions (FP/Sprint/Q/R by default), and builds the processed feature files so training can consume the whole season without manual repetition.
 
+8. **Backtest round-by-round improvements**
+   ```bash
+   poetry run f1ml pipeline backtest --season 2025 --round-start 5 --round-end 21
+   ```
+   For every GP it trains on all prior races, predicts the current one, and logs MAE/Spearman/top-K metrics to `reports/{season}/backtest_round_metrics.csv` so you can track performance drift across the season.
+
 See `docs/mvp_plan.md` for the v0 scope and roadmap. More CLI commands will be added as the feature and modeling layers come online.

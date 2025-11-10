@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import click
+import pandas as pd
 from rich.console import Console
 
 from f1ml.cli.ingest import DEFAULT_SESSION_CODES
+from f1ml.datasets import iter_feature_files, load_round_features
+from f1ml.evaluation import evaluate_round_predictions
 from f1ml.fastf1_ingest import ALLOWED_SESSION_CODES, ingest_weekend
 from f1ml.features import build_basic_weekend_features
+from f1ml.modeling.prediction import predict_round_results
+from f1ml.modeling.training import train_season_model
+from f1ml.config import get_project_paths
 
 console = Console()
 
@@ -88,3 +94,92 @@ def sync_season(
     console.print(
         f"[bold green]Season sync complete[/bold green]: processed {successful_rounds} rounds (season {season}, R{round_start}–R{final_round})."
     )
+
+
+@pipeline.command("backtest")
+@click.option("--season", type=int, required=True, help="Season to backtest (e.g., 2025).")
+@click.option("--round-start", type=int, default=2, show_default=True, help="First round to predict.")
+@click.option(
+    "--round-end",
+    type=int,
+    default=None,
+    help="Last round to include (defaults to last processed round).",
+)
+@click.option("--top-k", type=int, default=5, show_default=True, help="Top-K summary saved per round.")
+def backtest(season: int, round_start: int, round_end: Optional[int], top_k: int) -> None:
+    """Simulate the season round-by-round: train on past GPs, predict the next one."""
+    available_rounds: List[int] = [rnd for rnd, _ in iter_feature_files(season)]
+    if not available_rounds:
+        raise click.ClickException(
+            f"No processed features found for season {season}. Run 'pipeline sync-season' first."
+        )
+
+    max_round = max(available_rounds)
+    final_round = round_end or max_round
+    if final_round > max_round:
+        console.print(
+            f"[yellow]Only rounds up to {max_round} are available; capping round_end to {max_round}.[/yellow]"
+        )
+        final_round = max_round
+
+    reports_dir = get_project_paths().reports / str(season)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_rows: List[dict] = []
+
+    for round_number in range(round_start, final_round + 1):
+        training_rounds = [rnd for rnd in available_rounds if rnd < round_number]
+        if not training_rounds:
+            console.print(f"[yellow]Skipping round {round_number}: no prior races available for training.[/yellow]")
+            continue
+
+        console.rule(f"Backtest – Season {season} Round {round_number}")
+        last_train_round = training_rounds[-1]
+        try:
+            artifact_path, train_metrics = train_season_model(
+                season=season,
+                upto_round=last_train_round,
+                train_rounds=training_rounds,
+            )
+        except Exception as exc:
+            console.print(f"[red]Training failed for round {round_number}[/red]: {exc}")
+            continue
+
+        console.print(
+            f"Trained on rounds <= {last_train_round} (n={int(train_metrics['n_samples'])}) – MAE {train_metrics['mae']:.2f}"
+        )
+
+        try:
+            prediction_output = predict_round_results(
+                season=season,
+                round_number=round_number,
+                model_round=last_train_round,
+                top_k=top_k,
+            )
+            prediction_df = prediction_output["full_results"]
+        except Exception as exc:
+            console.print(f"[red]Prediction failed for round {round_number}[/red]: {exc}")
+            continue
+
+        try:
+            actual_df = load_round_features(season, round_number)
+            metrics = evaluate_round_predictions(
+                season=season,
+                round_number=round_number,
+                prediction_df=prediction_df,
+                actual_df=actual_df,
+            )
+            metrics_rows.append(metrics.to_dict())
+            console.print(
+                f"[green]Round {round_number}[/green] → MAE {metrics.mae:.2f}, Spearman {metrics.spearman:.2f}, baseline MAE {metrics.baseline_mae:.2f}"
+            )
+        except Exception as exc:
+            console.print(f"[yellow]Could not evaluate round {round_number}[/yellow]: {exc}")
+
+    if metrics_rows:
+        metrics_df = pd.DataFrame(metrics_rows)
+        metrics_path = reports_dir / "backtest_round_metrics.csv"
+        metrics_df.to_csv(metrics_path, index=False)
+        console.print(f"[bold green]Backtest metrics saved to {metrics_path}[/bold green]")
+    else:
+        console.print("[yellow]No metrics were recorded during backtest.[/yellow]")
