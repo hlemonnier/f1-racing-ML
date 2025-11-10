@@ -18,6 +18,7 @@ class ModelArtifact:
     training_rounds: List[int]
     n_samples: int
     model: Any
+    target_mode: str = "absolute"
 
 
 def save_model_artifact(artifact: ModelArtifact, path: Path) -> Path:

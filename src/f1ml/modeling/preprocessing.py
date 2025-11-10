@@ -7,8 +7,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-CATEGORICAL_COLUMNS: Tuple[str, ...] = ("Abbreviation", "DriverId", "TeamName", "TeamId")
-LEAKAGE_COLUMNS: Tuple[str, ...] = ("target_position", "race_position", "Points", "Status")
+CATEGORICAL_COLUMNS: Tuple[str, ...] = ("Abbreviation", "DriverId", "TeamName", "TeamId", "event_slug")
+LEAKAGE_COLUMNS: Tuple[str, ...] = ("target_position", "race_position", "Points", "Status", "GridPosition")
 
 
 def _build_category_mapping(series: pd.Series) -> Dict[str, int]:

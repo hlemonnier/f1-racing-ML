@@ -13,6 +13,7 @@ from f1ml.config import get_project_paths
 from f1ml.datasets import load_training_dataframe
 from f1ml.modeling.artifacts import ModelArtifact, save_model_artifact
 from f1ml.modeling.preprocessing import prepare_feature_matrix
+from f1ml.modeling.utils import apply_grid_delta_predictions, baseline_grid_positions
 
 
 def _default_model() -> LGBMRegressor:
@@ -38,16 +39,22 @@ def train_season_model(
     if "target_position" not in df.columns:
         raise ValueError("Training dataframe missing target_position column.")
 
-    y = df["target_position"].astype(float).to_numpy()
+    baseline_positions = baseline_grid_positions(df)
+    deltas = (df["target_position"].astype(float) - baseline_positions).to_numpy()
     feature_df = df.drop(columns=["target_position"])
     X, categorical_mappings, feature_columns = prepare_feature_matrix(feature_df)
 
     model = _default_model()
-    model.fit(X, y)
+    model.fit(X, deltas)
 
-    preds = model.predict(X)
-    mae = float(mean_absolute_error(y, preds))
-    spearman = float(spearmanr(y, preds).correlation)
+    delta_preds = model.predict(X)
+    abs_preds = apply_grid_delta_predictions(
+        baseline_positions,
+        delta_preds,
+        max_position=int(max(20, df["target_position"].max())),
+    )
+    mae = float(mean_absolute_error(df["target_position"], abs_preds))
+    spearman = float(spearmanr(df["target_position"], abs_preds).correlation)
 
     training_rounds = sorted(df["round"].unique())
     artifact = ModelArtifact(
@@ -56,8 +63,9 @@ def train_season_model(
         feature_columns=feature_columns,
         categorical_mappings=categorical_mappings,
         training_rounds=training_rounds,
-        n_samples=len(y),
+        n_samples=len(deltas),
         model=model,
+        target_mode="grid_delta",
     )
 
     models_dir = get_project_paths().models / str(season)
@@ -67,6 +75,6 @@ def train_season_model(
     metrics = {
         "mae": mae,
         "spearman": spearman,
-        "n_samples": float(len(y)),
+        "n_samples": float(artifact.n_samples),
     }
     return artifact_path, metrics

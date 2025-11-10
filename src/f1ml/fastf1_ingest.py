@@ -17,8 +17,8 @@ from f1ml.io import write_json, write_parquet
 
 console = Console()
 
-ALLOWED_SESSION_CODES = ("FP1", "FP2", "FP3", "SQ", "SR", "Q", "R")
-DEFAULT_SESSION_CODES = ("FP1", "FP2", "FP3", "SQ", "SR", "Q", "R")
+ALLOWED_SESSION_CODES = ("FP1", "FP2", "FP3", "SQ", "S", "Q", "R")
+DEFAULT_SESSION_CODES = ("FP1", "FP2", "FP3", "SQ", "S", "Q", "R")
 
 
 @dataclass

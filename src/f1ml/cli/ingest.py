@@ -33,7 +33,7 @@ def ingest():
     multiple=True,
     default=DEFAULT_SESSION_CODES,
     show_default=True,
-    help="Session code(s) to download (FP1/FP2/FP3/SQ/SR/Q/R). Repeat the option to specify multiple sessions.",
+    help="Session code(s) to download (FP1/FP2/FP3/SQ/S/Q/R). Repeat the option to specify multiple sessions.",
 )
 @click.option(
     "--cache-dir",

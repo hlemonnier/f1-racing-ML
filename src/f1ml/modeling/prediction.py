@@ -11,6 +11,7 @@ from f1ml.config import get_project_paths
 from f1ml.datasets import load_round_features
 from f1ml.modeling.artifacts import load_model_artifact
 from f1ml.modeling.preprocessing import prepare_feature_matrix
+from f1ml.modeling.utils import apply_grid_delta_predictions, baseline_grid_positions
 
 
 def _artifact_path(season: int, model_round: int) -> Path:
@@ -26,12 +27,22 @@ def predict_round_results(
     """Generate predictions for a round using a stored artifact."""
     artifact = load_model_artifact(_artifact_path(season, model_round))
     raw_features = load_round_features(season, round_number)
+    baseline_positions = baseline_grid_positions(raw_features)
 
     feature_df = raw_features.drop(columns=["target_position"], errors="ignore")
     X, _, _ = prepare_feature_matrix(
         feature_df, categorical_mappings=artifact.categorical_mappings, expected_columns=artifact.feature_columns
     )
-    predictions = artifact.model.predict(X)
+    raw_predictions = artifact.model.predict(X)
+    target_mode = getattr(artifact, "target_mode", "absolute")
+    if target_mode == "grid_delta":
+        predictions = apply_grid_delta_predictions(
+            baseline_positions,
+            raw_predictions,
+            max_position=len(baseline_positions),
+        )
+    else:
+        predictions = raw_predictions
 
     results = raw_features[["DriverNumber", "DriverId", "TeamName"]].copy()
     results["predicted_position"] = predictions

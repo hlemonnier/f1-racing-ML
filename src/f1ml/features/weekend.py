@@ -20,14 +20,14 @@ OPTIONAL_LAP_SESSIONS: Dict[str, str] = {
     "FP2": "fp2",
     "FP3": "fp3",
     "SQ": "sq",
-    "SR": "sr",
+    "S": "sr",
 }
 
 LONG_RUN_SESSIONS: Dict[str, str] = {
     "FP1": "fp1",
     "FP2": "fp2",
     "FP3": "fp3",
-    "SR": "sr",
+    "S": "sr",
 }
 
 MIN_LONG_RUN_LAPS = 5
@@ -123,11 +123,16 @@ def _series_to_seconds(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series, errors="coerce")
 
 
+def _has_valid_lap_data(laps_df: pd.DataFrame | None) -> bool:
+    if laps_df is None or "LapTime" not in laps_df.columns:
+        return False
+    return bool(laps_df["LapTime"].notna().any())
+
+
 def _maybe_merge_session_best_laps(
-    features: pd.DataFrame, base_dir: Path, session_code: str, prefix: str
+    features: pd.DataFrame, laps_df: pd.DataFrame | None, prefix: str
 ) -> pd.DataFrame:
-    laps_df = _load_session_parquet(base_dir, session_code, "laps")
-    if laps_df is None or "LapTime" not in laps_df:
+    if not _has_valid_lap_data(laps_df):
         return features
     session_bests = _best_lap_per_driver(laps_df, prefix)
     return features.merge(session_bests, on="DriverNumber", how="left")
@@ -306,9 +311,8 @@ def _compute_clean_air_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.
 
 
 def _maybe_merge_long_run_features(
-    features: pd.DataFrame, base_dir: Path, session_code: str, prefix: str
+    features: pd.DataFrame, laps_df: pd.DataFrame | None, prefix: str
 ) -> pd.DataFrame:
-    laps_df = _load_session_parquet(base_dir, session_code, "laps")
     if laps_df is None:
         return features
     long_run_df = _compute_long_run_features(laps_df, prefix)
@@ -320,7 +324,10 @@ def _maybe_merge_long_run_features(
 def _merge_on_driver(features: pd.DataFrame, addon: pd.DataFrame) -> pd.DataFrame:
     for key in ("DriverId", "DriverNumber", "Abbreviation"):
         if key in features.columns and key in addon.columns:
-            return features.merge(addon, on=key, how="left")
+            addon_clean = addon.loc[:, ~addon.columns.duplicated()]
+            overlap = [col for col in addon_clean.columns if col in features.columns and col != key]
+            addon_clean = addon_clean.drop(columns=overlap)
+            return features.merge(addon_clean, on=key, how="left")
     return features
 
 
@@ -412,7 +419,7 @@ def _inject_prev_year_features(features: pd.DataFrame, season: int, base_dir: Pa
     if prev_race is not None:
         features = _merge_on_driver(features, prev_race)
 
-    prev_sr = _prev_year_race_features(prev_dir, "SR", "sprint")
+    prev_sr = _prev_year_race_features(prev_dir, "S", "sprint")
     if prev_sr is not None:
         features = _merge_on_driver(features, prev_sr)
 
@@ -462,49 +469,6 @@ def _inject_standings_features(features: pd.DataFrame, season: int, round_number
     return features
 
 
-def _ensure_optional_session_columns(features: pd.DataFrame) -> pd.DataFrame:
-    if features.empty:
-        return features
-
-    n_rows = len(features)
-    for prefix in OPTIONAL_LAP_SESSIONS.values():
-        time_col = f"best_{prefix}_laptime"
-        time_sec_col = f"best_{prefix}_laptime_sec"
-        rank_col = f"best_{prefix}_rank"
-
-        if time_col not in features:
-            features[time_col] = pd.Series([pd.NaT] * n_rows, dtype="timedelta64[ns]")
-        if time_sec_col not in features:
-            features[time_sec_col] = pd.Series([pd.NA] * n_rows, dtype="Float64")
-        if rank_col not in features:
-            features[rank_col] = pd.Series([pd.NA] * n_rows, dtype="Float64")
-
-        # Long-run placeholders
-        lr_cols = [
-            f"best_{prefix}_longrun_mean",
-            f"best_{prefix}_longrun_std",
-            f"best_{prefix}_longrun_slope",
-            f"best_{prefix}_longrun_laps",
-            f"{prefix}_longrun_consistency",
-            f"{prefix}_longrun_delta",
-            f"{prefix}_max_consec_valid",
-            f"best_{prefix}_clean_mean",
-            f"best_{prefix}_clean_std",
-            f"best_{prefix}_clean_slope",
-            f"best_{prefix}_clean_laps",
-            f"best_{prefix}_clean_best",
-            f"{prefix}_clean_delta",
-            f"best_{prefix}_clean_ref_mean",
-            f"best_{prefix}_clean_ref_best",
-            f"{prefix}_clean_ref_delta",
-        ]
-        for col in lr_cols:
-            if col not in features:
-                features[col] = pd.Series([pd.NA] * n_rows, dtype="Float64")
-
-    return features
-
-
 def _apply_weather_penalty(features: pd.DataFrame, weather: Dict[str, float]) -> pd.DataFrame:
     rain_prob = weather.get("weather_rain_probability", 0.0) or 0.0
     if rain_prob < 0.2:
@@ -521,8 +485,6 @@ def _apply_weather_penalty(features: pd.DataFrame, weather: Dict[str, float]) ->
 def _inject_rain_uplift_features(features: pd.DataFrame, season: int) -> pd.DataFrame:
     uplift_df = ensure_rain_uplift(season)
     if uplift_df is None or uplift_df.empty:
-        features["driver_rain_uplift"] = pd.Series([pd.NA] * len(features), dtype="Float64")
-        features["team_rain_uplift"] = pd.Series([pd.NA] * len(features), dtype="Float64")
         return features
 
     driver_map = uplift_df.groupby("driver_id")["rain_uplift"].mean().to_dict()
@@ -587,15 +549,31 @@ def build_basic_weekend_features(season: int, round_number: int) -> Path:
     if "GridPosition" in features and "qualifying_position" in features:
         features["grid_delta_vs_quali"] = features["GridPosition"] - features["qualifying_position"]
 
+    session_laps: Dict[str, pd.DataFrame | None] = {}
+    session_codes = set(OPTIONAL_LAP_SESSIONS.keys()) | set(LONG_RUN_SESSIONS.keys())
+    for session_code in sorted(session_codes):
+        session_laps[session_code] = _load_session_parquet(base_dir, session_code, "laps")
+
+    session_availability: Dict[str, bool] = {prefix: False for prefix in OPTIONAL_LAP_SESSIONS.values()}
     for session_code, prefix in OPTIONAL_LAP_SESSIONS.items():
-        features = _maybe_merge_session_best_laps(features, base_dir, session_code, prefix)
+        laps_df = session_laps.get(session_code)
+        has_data = _has_valid_lap_data(laps_df)
+        if has_data:
+            features = _maybe_merge_session_best_laps(features, laps_df, prefix)
+        session_availability[prefix] = has_data
 
     for session_code, prefix in LONG_RUN_SESSIONS.items():
-        features = _maybe_merge_long_run_features(features, base_dir, session_code, prefix)
-        laps_df = _load_session_parquet(base_dir, session_code, "laps")
-        clean_df = _compute_clean_air_features(laps_df, prefix) if laps_df is not None else None
+        laps_df = session_laps.get(session_code)
+        if laps_df is None:
+            continue
+        features = _maybe_merge_long_run_features(features, laps_df, prefix)
+        clean_df = _compute_clean_air_features(laps_df, prefix)
         if clean_df is not None:
             features = features.merge(clean_df, on="DriverNumber", how="left")
+
+    for prefix, available in session_availability.items():
+        availability_value = 1.0 if available else 0.0
+        features[f"{prefix}_session_available"] = availability_value
 
     features = _inject_prev_year_features(features, season, base_dir)
     features = _inject_standings_features(features, season, round_number)
@@ -604,7 +582,7 @@ def build_basic_weekend_features(season: int, round_number: int) -> Path:
     for key, value in weather.items():
         features[key] = value
     features = _apply_weather_penalty(features, weather)
-    features = _ensure_optional_session_columns(features)
+    features["event_slug"] = event_slug
 
     if "race_position" in features:
         features["target_position"] = features["race_position"]
