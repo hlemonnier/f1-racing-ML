@@ -105,6 +105,17 @@ def _convert_timedelta_columns(df: pd.DataFrame, columns: List[str], suffix: str
     return result
 
 
+def _series_to_seconds(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="float64")
+    if pd.api.types.is_numeric_dtype(series):
+        return series.astype(float)
+    try:
+        return pd.to_timedelta(series).dt.total_seconds()
+    except (ValueError, TypeError):
+        return pd.to_numeric(series, errors="coerce")
+
+
 def _maybe_merge_session_best_laps(
     features: pd.DataFrame, base_dir: Path, session_code: str, prefix: str
 ) -> pd.DataFrame:
@@ -124,6 +135,62 @@ def _prepare_valid_laps(laps: pd.DataFrame) -> pd.DataFrame:
         df = df[df["Deleted"].ne(True)]
     df["lap_seconds"] = pd.to_timedelta(df["LapTime"]).dt.total_seconds()
     return df[df["lap_seconds"].notna()]
+
+
+def _stint_lap_numbers(df: pd.DataFrame) -> pd.Series:
+    if "LapNumber" in df.columns:
+        return df.groupby(["DriverNumber", "Stint"]) ["LapNumber"].rank(method="first")
+    return df.groupby(["DriverNumber", "Stint"]).cumcount() + 1
+
+
+def _filter_clean_air_laps(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    filtered = df.copy()
+    filtered["stint_lap"] = _stint_lap_numbers(filtered)
+    stint_lengths = filtered.groupby(["DriverNumber", "Stint"]) ["stint_lap"].transform("max")
+    filtered = filtered[stint_lengths >= MIN_CLEAN_STINT_LAPS]
+    filtered = filtered[filtered["stint_lap"] > 1]
+
+    if "TrackStatus" in filtered.columns:
+        filtered = filtered[filtered["TrackStatus"].astype(str).isin({"1", "0", ""})]
+
+    gap_mask = None
+    for gap_col in ("GapToAhead", "GapAhead", "GapToNext", "GapToLeader"):
+        if gap_col in filtered.columns:
+            seconds = _series_to_seconds(filtered[gap_col])
+            mask = seconds > 2.5
+            gap_mask = mask if gap_mask is None else (gap_mask & mask)
+    if gap_mask is not None:
+        filtered = filtered[gap_mask.fillna(False)]
+
+    speed_col = None
+    for col in ("SpeedST", "SpeedFL", "SpeedI1"):
+        if col in filtered.columns:
+            speed_col = col
+            break
+    if speed_col:
+        if "Compound" in filtered.columns:
+            med = filtered.groupby("Compound")[speed_col].transform("median")
+            std = filtered.groupby("Compound")[speed_col].transform("std").fillna(0)
+        else:
+            med_val = filtered[speed_col].median()
+            std_val = filtered[speed_col].std() or 0
+            med = pd.Series(med_val, index=filtered.index)
+            std = pd.Series(std_val, index=filtered.index)
+        filtered = filtered[filtered[speed_col] <= med + 2 * std]
+
+    median = filtered.groupby(["DriverNumber", "Stint"])["lap_seconds"].transform("median")
+    mad = (
+        (filtered["lap_seconds"] - median)
+        .abs()
+        .groupby([filtered["DriverNumber"], filtered["Stint"]])
+        .transform("median")
+    )
+    mad = mad.replace(0, 1e-6)
+    resid = (filtered["lap_seconds"] - median).abs()
+    filtered = filtered[resid <= (mad + RESIDUAL_THRESHOLD)]
+    return filtered
 
 
 def _compute_long_run_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.DataFrame]:
@@ -177,6 +244,48 @@ def _compute_long_run_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.D
     df = pd.DataFrame(results)
     session_min = df[f"best_{prefix}_longrun_mean"].min()
     df[f"{prefix}_longrun_delta"] = df[f"best_{prefix}_longrun_mean"] - session_min
+    return df
+
+
+def _compute_clean_air_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.DataFrame]:
+    valid = _prepare_valid_laps(laps)
+    clean = _filter_clean_air_laps(valid)
+    if clean.empty:
+        return None
+
+    results: List[Dict[str, float]] = []
+
+    for driver, driver_laps in clean.groupby("DriverNumber"):
+        driver_laps = driver_laps.sort_values(["Stint", "LapNumber"])
+        best_entry: Optional[Dict[str, float]] = None
+        for _, stint_df in driver_laps.groupby("Stint"):
+            if len(stint_df) < MIN_CLEAN_STINT_LAPS:
+                continue
+            secs = stint_df["lap_seconds"].to_numpy()
+            if len(secs) < MIN_CLEAN_STINT_LAPS:
+                continue
+            mean_val = float(np.mean(secs))
+            std_val = float(np.std(secs, ddof=0))
+            slope = float(np.polyfit(np.arange(len(secs)), secs, 1)[0]) if len(secs) >= 2 else np.nan
+            entry = {
+                "DriverNumber": driver,
+                f"best_{prefix}_clean_mean": mean_val,
+                f"best_{prefix}_clean_std": std_val,
+                f"best_{prefix}_clean_slope": slope,
+                f"best_{prefix}_clean_laps": float(len(secs)),
+                f"best_{prefix}_clean_best": float(np.min(secs)),
+            }
+            if best_entry is None or entry[f"best_{prefix}_clean_mean"] < best_entry[f"best_{prefix}_clean_mean"]:
+                best_entry = entry
+        if best_entry is not None:
+            results.append(best_entry)
+
+    if not results:
+        return None
+
+    df = pd.DataFrame(results)
+    session_min = df[f"best_{prefix}_clean_mean"].min()
+    df[f"{prefix}_clean_delta"] = df[f"best_{prefix}_clean_mean"] - session_min
     return df
 
 
@@ -257,7 +366,20 @@ def _prev_year_race_features(prev_dir: Path, session_code: str, prefix: str) -> 
             "sector3_mean": f"prev_{prefix}_sector3_mean",
         }
     ).reset_index()
+    results_map = _load_session_parquet(prev_dir, session_code, "results")
+    if results_map is not None and "DriverNumber" in results_map.columns:
+        id_cols = [col for col in ("DriverId", "Abbreviation") if col in results_map.columns]
+        if id_cols:
+            mapping = results_map[["DriverNumber", *id_cols]].drop_duplicates("DriverNumber")
+            agg = agg.merge(mapping, on="DriverNumber", how="left")
     return agg
+
+
+def _prev_year_clean_air_features(prev_dir: Path) -> Optional[pd.DataFrame]:
+    laps = _load_session_parquet(prev_dir, "R", "laps")
+    if laps is None:
+        return None
+    return _compute_clean_air_features(laps, "prev_race")
 
 
 def _inject_prev_year_features(features: pd.DataFrame, season: int, base_dir: Path) -> pd.DataFrame:
@@ -272,11 +394,15 @@ def _inject_prev_year_features(features: pd.DataFrame, season: int, base_dir: Pa
 
     prev_race = _prev_year_race_features(prev_dir, "R", "race")
     if prev_race is not None:
-        features = features.merge(prev_race, on="DriverNumber", how="left")
+        features = _merge_on_driver(features, prev_race)
 
     prev_sr = _prev_year_race_features(prev_dir, "SR", "sprint")
     if prev_sr is not None:
-        features = features.merge(prev_sr, on="DriverNumber", how="left")
+        features = _merge_on_driver(features, prev_sr)
+
+    prev_clean = _prev_year_clean_air_features(prev_dir)
+    if prev_clean is not None:
+        features = _merge_on_driver(features, prev_clean)
 
     return features
 
@@ -294,9 +420,13 @@ def _inject_standings_features(features: pd.DataFrame, season: int, round_number
         features["champ_position"] = (
             features[driver_key].map(snapshot.driver_positions).astype("Float64")
         )
+        features["driver_form_last3"] = (
+            features[driver_key].map(snapshot.driver_form_last3).astype("Float64")
+        )
     else:
         features["champ_points_to_date"] = pd.Series([pd.NA] * len(features), dtype="Float64")
         features["champ_position"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+        features["driver_form_last3"] = pd.Series([pd.NA] * len(features), dtype="Float64")
 
     if team_key:
         features["team_points_to_date"] = (
@@ -305,9 +435,13 @@ def _inject_standings_features(features: pd.DataFrame, season: int, round_number
         features["team_champ_position"] = (
             features[team_key].map(snapshot.team_positions).astype("Float64")
         )
+        features["team_form_last3"] = (
+            features[team_key].map(snapshot.team_form_last3).astype("Float64")
+        )
     else:
         features["team_points_to_date"] = pd.Series([pd.NA] * len(features), dtype="Float64")
         features["team_champ_position"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+        features["team_form_last3"] = pd.Series([pd.NA] * len(features), dtype="Float64")
 
     return features
 
@@ -343,6 +477,19 @@ def _ensure_optional_session_columns(features: pd.DataFrame) -> pd.DataFrame:
             if col not in features:
                 features[col] = pd.Series([pd.NA] * n_rows, dtype="Float64")
 
+    return features
+
+
+def _apply_weather_penalty(features: pd.DataFrame, weather: Dict[str, float]) -> pd.DataFrame:
+    rain_prob = weather.get("weather_rain_probability", 0.0) or 0.0
+    if rain_prob < 0.2:
+        features["qualifying_wet_factor"] = 1.0
+        return features
+    factor = 1 + 0.3 * min(1.0, float(rain_prob))
+    for col in ("best_q_laptime_sec", "Q1_seconds", "Q2_seconds", "Q3_seconds"):
+        if col in features:
+            features[col] = features[col] * factor
+    features["qualifying_wet_factor"] = factor
     return features
 
 
@@ -400,12 +547,17 @@ def build_basic_weekend_features(season: int, round_number: int) -> Path:
 
     for session_code, prefix in LONG_RUN_SESSIONS.items():
         features = _maybe_merge_long_run_features(features, base_dir, session_code, prefix)
+        laps_df = _load_session_parquet(base_dir, session_code, "laps")
+        clean_df = _compute_clean_air_features(laps_df, prefix) if laps_df is not None else None
+        if clean_df is not None:
+            features = features.merge(clean_df, on="DriverNumber", how="left")
 
     features = _inject_prev_year_features(features, season, base_dir)
     features = _inject_standings_features(features, season, round_number)
     weather = get_weather_features(event_slug, season, round_number)
     for key, value in weather.items():
         features[key] = value
+    features = _apply_weather_penalty(features, weather)
     features = _ensure_optional_session_columns(features)
 
     if "race_position" in features:

@@ -14,8 +14,10 @@ from f1ml.datasets import iter_feature_files
 class StandingsSnapshot:
     driver_points: Dict[str, float]
     driver_positions: Dict[str, int]
+    driver_form_last3: Dict[str, float]
     team_points: Dict[str, float]
     team_positions: Dict[str, int]
+    team_form_last3: Dict[str, float]
 
 
 def _sort_points(points: Dict[str, float]) -> Dict[str, int]:
@@ -36,6 +38,9 @@ def build_standings(season: int, upto_round: int) -> StandingsSnapshot:
     except FileNotFoundError:
         feature_files = []
 
+    driver_points_history: Dict[str, List[Tuple[int, float]]] = {}
+    team_points_history: Dict[str, List[Tuple[int, float]]] = {}
+
     for round_number, path in feature_files:
         if round_number >= upto_round:
             continue
@@ -50,15 +55,30 @@ def build_standings(season: int, upto_round: int) -> StandingsSnapshot:
 
             if driver_id:
                 driver_points[driver_id] = driver_points.get(driver_id, 0.0) + pts
+                driver_points_history.setdefault(driver_id, []).append((round_number, pts))
             if team_name:
                 team_points[team_name] = team_points.get(team_name, 0.0) + pts
+                team_points_history.setdefault(team_name, []).append((round_number, pts))
 
     driver_positions = _sort_points(driver_points)
     team_positions = _sort_points(team_points)
 
+    def _last_three_sum(history: Dict[str, List[Tuple[int, float]]]) -> Dict[str, float]:
+        result: Dict[str, float] = {}
+        for key, values in history.items():
+            values = sorted(values, key=lambda x: x[0])
+            last_three = values[-3:]
+            result[key] = float(sum(pt for _, pt in last_three))
+        return result
+
+    driver_form = _last_three_sum(driver_points_history)
+    team_form = _last_three_sum(team_points_history)
+
     return StandingsSnapshot(
         driver_points=driver_points,
         driver_positions=driver_positions,
+        driver_form_last3=driver_form,
         team_points=team_points,
         team_positions=team_positions,
+        team_form_last3=team_form,
     )
