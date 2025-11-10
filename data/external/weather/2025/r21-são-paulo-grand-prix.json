@@ -1,0 +1,8 @@
+{
+  "temperature": 15.37,
+  "rain_probability": 0,
+  "wind_speed": 4.78,
+  "humidity": 81,
+  "timestamp": "2025-11-11 00:00:00",
+  "source": "openweather"
+}

@@ -13,6 +13,7 @@ from f1ml.config import get_project_paths
 from f1ml.io import write_parquet
 from f1ml.standings import build_standings
 from f1ml.weather import get_weather_features
+from f1ml.rain_uplift import ensure_rain_uplift
 
 OPTIONAL_LAP_SESSIONS: Dict[str, str] = {
     "FP1": "fp1",
@@ -32,6 +33,12 @@ LONG_RUN_SESSIONS: Dict[str, str] = {
 MIN_LONG_RUN_LAPS = 5
 MIN_CLEAN_STINT_LAPS = 6
 RESIDUAL_THRESHOLD = 0.6  # seconds
+FUEL_START_KG = 105.0
+FUEL_CONSUMPTION_KG = 1.8
+FUEL_REF_KG = 70.0
+STINT_REF_LAP = 5
+ALPHA_FUEL = 0.03  # sec per kg
+DEGRADATION_PER_LAP = 0.03  # sec per lap
 
 
 def _find_weekend_dir(season: int, round_number: int) -> Path:
@@ -267,6 +274,11 @@ def _compute_clean_air_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.
             mean_val = float(np.mean(secs))
             std_val = float(np.std(secs, ddof=0))
             slope = float(np.polyfit(np.arange(len(secs)), secs, 1)[0]) if len(secs) >= 2 else np.nan
+            stint_laps = stint_df["stint_lap"].to_numpy()
+            fuel_est = FUEL_START_KG - FUEL_CONSUMPTION_KG * (stint_laps - 1)
+            ref_adjusted = secs - ALPHA_FUEL * (fuel_est - FUEL_REF_KG) - DEGRADATION_PER_LAP * (stint_laps - STINT_REF_LAP)
+            ref_mean = float(np.mean(ref_adjusted))
+            ref_best = float(np.min(ref_adjusted))
             entry = {
                 "DriverNumber": driver,
                 f"best_{prefix}_clean_mean": mean_val,
@@ -274,6 +286,8 @@ def _compute_clean_air_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.
                 f"best_{prefix}_clean_slope": slope,
                 f"best_{prefix}_clean_laps": float(len(secs)),
                 f"best_{prefix}_clean_best": float(np.min(secs)),
+                f"best_{prefix}_clean_ref_mean": ref_mean,
+                f"best_{prefix}_clean_ref_best": ref_best,
             }
             if best_entry is None or entry[f"best_{prefix}_clean_mean"] < best_entry[f"best_{prefix}_clean_mean"]:
                 best_entry = entry
@@ -286,6 +300,8 @@ def _compute_clean_air_features(laps: pd.DataFrame, prefix: str) -> Optional[pd.
     df = pd.DataFrame(results)
     session_min = df[f"best_{prefix}_clean_mean"].min()
     df[f"{prefix}_clean_delta"] = df[f"best_{prefix}_clean_mean"] - session_min
+    session_ref_min = df[f"best_{prefix}_clean_ref_mean"].min()
+    df[f"{prefix}_clean_ref_delta"] = df[f"best_{prefix}_clean_ref_mean"] - session_ref_min
     return df
 
 
@@ -472,6 +488,15 @@ def _ensure_optional_session_columns(features: pd.DataFrame) -> pd.DataFrame:
             f"{prefix}_longrun_consistency",
             f"{prefix}_longrun_delta",
             f"{prefix}_max_consec_valid",
+            f"best_{prefix}_clean_mean",
+            f"best_{prefix}_clean_std",
+            f"best_{prefix}_clean_slope",
+            f"best_{prefix}_clean_laps",
+            f"best_{prefix}_clean_best",
+            f"{prefix}_clean_delta",
+            f"best_{prefix}_clean_ref_mean",
+            f"best_{prefix}_clean_ref_best",
+            f"{prefix}_clean_ref_delta",
         ]
         for col in lr_cols:
             if col not in features:
@@ -490,6 +515,26 @@ def _apply_weather_penalty(features: pd.DataFrame, weather: Dict[str, float]) ->
         if col in features:
             features[col] = features[col] * factor
     features["qualifying_wet_factor"] = factor
+    return features
+
+
+def _inject_rain_uplift_features(features: pd.DataFrame, season: int) -> pd.DataFrame:
+    uplift_df = ensure_rain_uplift(season)
+    if uplift_df is None or uplift_df.empty:
+        features["driver_rain_uplift"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+        features["team_rain_uplift"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+        return features
+
+    driver_map = uplift_df.groupby("driver_id")["rain_uplift"].mean().to_dict()
+    team_map = uplift_df.groupby("team_name")["rain_uplift"].mean().to_dict()
+
+    driver_key = "Abbreviation" if "Abbreviation" in features else "DriverId"
+    driver_series = features[driver_key].astype(str).str.upper()
+    features["driver_rain_uplift"] = driver_series.map(driver_map).astype("Float64")
+    if "TeamName" in features:
+        features["team_rain_uplift"] = features["TeamName"].astype(str).map(team_map).astype("Float64")
+    else:
+        features["team_rain_uplift"] = pd.Series([pd.NA] * len(features), dtype="Float64")
     return features
 
 
@@ -554,6 +599,7 @@ def build_basic_weekend_features(season: int, round_number: int) -> Path:
 
     features = _inject_prev_year_features(features, season, base_dir)
     features = _inject_standings_features(features, season, round_number)
+    features = _inject_rain_uplift_features(features, season)
     weather = get_weather_features(event_slug, season, round_number)
     for key, value in weather.items():
         features[key] = value
