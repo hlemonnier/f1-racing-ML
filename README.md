@@ -58,5 +58,6 @@ Pipeline that ingests F1 qualifying/race data via FastF1, engineers features, tr
 ### Optional data sources
 - **Previous season auto-fetch**: `pipeline sync-season` automatically downloads season `N-1` when you fetch season `N`, so the feature builder can inject prior-year Quali/Race metrics without extra manual steps. Disable with `--no-include-prev-year` if needed.
 - **Weather forecasts**: set `OPENWEATHER_API_KEY` in your environment to let the pipeline cache forecasts per Grand Prix (`data/external/weather/...`). Without a key, neutral default values are used.
+- **Weather forecasts**: store `OPENWEATHER_API_KEY` in a `.env` file at the repo root (automatically loaded via python-dotenv) so the pipeline can call OpenWeather and cache per-GP forecasts under `data/external/weather/`. Without it, neutral values are used.
 
 See `docs/mvp_plan.md` for the v0 scope and roadmap. More CLI commands will be added as the feature and modeling layers come online.

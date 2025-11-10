@@ -30,6 +30,8 @@ LONG_RUN_SESSIONS: Dict[str, str] = {
 }
 
 MIN_LONG_RUN_LAPS = 5
+MIN_CLEAN_STINT_LAPS = 6
+RESIDUAL_THRESHOLD = 0.6  # seconds
 
 
 def _find_weekend_dir(season: int, round_number: int) -> Path:
