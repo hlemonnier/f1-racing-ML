@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
+import glob
+import json
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
 
 import click
 import pandas as pd
@@ -18,6 +21,19 @@ from f1ml.modeling.training import train_season_model
 from f1ml.config import get_project_paths
 
 console = Console()
+
+
+def _extract_event_context(summary: dict) -> Tuple[Optional[Path], Optional[str]]:
+    for session_code in ("Q", "R", "FP1", "SQ"):
+        info = summary.get(session_code)
+        if not info:
+            continue
+        meta_path = Path(info["metadata"])
+        if not meta_path.exists():
+            continue
+        data = json.loads(meta_path.read_text())
+        return meta_path.parent, data.get("event_name")
+    return None, None
 
 
 @click.group(help="Higher-level orchestration commands.")
@@ -49,12 +65,19 @@ def pipeline():
     default=False,
     help="Only download raw sessions, do not build processed features.",
 )
+@click.option(
+    "--include-prev-year/--no-include-prev-year",
+    default=True,
+    show_default=True,
+    help="Automatically fetch the previous season for matching rounds.",
+)
 def sync_season(
     season: int,
     round_start: int,
     round_end: Optional[int],
     sessions: Sequence[str],
     skip_features: bool,
+    include_prev_year: bool,
 ) -> None:
     """Download & process multiple rounds in one go."""
     if round_start < 1:
@@ -71,15 +94,49 @@ def sync_season(
     for round_number in range(round_start, final_round + 1):
         console.rule(f"Season {season} – Round {round_number}")
         try:
-            ingest_weekend(
+            summary = ingest_weekend(
                 season=season,
                 round_number=round_number,
                 session_codes=requested_sessions,
             )
+            base_dir, event_name = _extract_event_context(summary)
             successful_rounds += 1
         except Exception as exc:
             console.print(f"[red]Failed ingest for round {round_number}[/red]: {exc}")
             continue
+
+        if include_prev_year and season > 1950:
+            paths = get_project_paths()
+            prev_season = season - 1
+            event_slug = None
+            if base_dir is not None:
+                event_slug = base_dir.name.split('-', 1)[1] if '-' in base_dir.name else base_dir.name
+
+            need_event = True
+            if event_slug:
+                prev_event_pattern = str(paths.data_raw / str(prev_season) / f"*-{event_slug}")
+                need_event = not glob.glob(prev_event_pattern)
+
+            if need_event and event_name:
+                console.print(
+                    f"[cyan]Fetching previous season data[/cyan] for {event_name} (season {prev_season})."
+                )
+                try:
+                    ingest_weekend(
+                        season=prev_season,
+                        round_number=None,
+                        event_name=event_name,
+                        session_codes=requested_sessions,
+                    )
+                    if not skip_features:
+                        # Try to infer round from newly created directory
+                        glob_pattern = str(paths.data_raw / str(prev_season) / f"*-{event_slug}") if event_slug else None
+                        glob_path = glob.glob(glob_pattern) if glob_pattern else []
+                        if glob_path:
+                            inferred_round = int(Path(glob_path[0]).name.split('-')[0][1:3])
+                            build_basic_weekend_features(season=prev_season, round_number=inferred_round)
+                except Exception as exc:
+                    console.print(f"[yellow]Prev-season ingestion failed[/yellow]: {exc}")
 
         if skip_features:
             continue

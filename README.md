@@ -55,4 +55,8 @@ Pipeline that ingests F1 qualifying/race data via FastF1, engineers features, tr
    ```
    For every GP it trains on all prior races, predicts the current one, and logs MAE/Spearman/top-K metrics to `reports/{season}/backtest_round_metrics.csv` so you can track performance drift across the season.
 
+### Optional data sources
+- **Previous season auto-fetch**: `pipeline sync-season` automatically downloads season `N-1` when you fetch season `N`, so the feature builder can inject prior-year Quali/Race metrics without extra manual steps. Disable with `--no-include-prev-year` if needed.
+- **Weather forecasts**: set `OPENWEATHER_API_KEY` in your environment to let the pipeline cache forecasts per Grand Prix (`data/external/weather/...`). Without a key, neutral default values are used.
+
 See `docs/mvp_plan.md` for the v0 scope and roadmap. More CLI commands will be added as the feature and modeling layers come online.

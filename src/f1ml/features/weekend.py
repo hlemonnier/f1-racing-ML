@@ -11,6 +11,8 @@ import pandas as pd
 
 from f1ml.config import get_project_paths
 from f1ml.io import write_parquet
+from f1ml.standings import build_standings
+from f1ml.weather import get_weather_features
 
 OPTIONAL_LAP_SESSIONS: Dict[str, str] = {
     "FP1": "fp1",
@@ -41,8 +43,30 @@ def _find_weekend_dir(season: int, round_number: int) -> Path:
     return Path(matches[0])
 
 
+def _event_slug_from_dir(base_dir: Path) -> str:
+    name = base_dir.name
+    parts = name.split('-', 1)
+    if len(parts) == 2:
+        return parts[1]
+    return name
+
+
 def _session_file(base_dir: Path, session_code: str, suffix: str) -> Path:
     return base_dir / f"{session_code}_{suffix}.parquet"
+
+
+def _find_prev_season_dir(event_slug: str, season: int) -> Optional[Path]:
+    prev_season = season - 1
+    if prev_season < 1950:
+        return None
+    paths = get_project_paths()
+    pattern = str(paths.data_raw / str(prev_season) / f"r*-{event_slug}")
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    # Prefer same round index if multiple
+    matches.sort()
+    return Path(matches[0])
 
 
 def _load_session_parquet(base_dir: Path, session_code: str, suffix: str) -> pd.DataFrame | None:
@@ -69,6 +93,14 @@ def _best_lap_per_driver(laps: pd.DataFrame, prefix: str) -> pd.DataFrame:
     best[f"best_{prefix}_laptime_sec"] = pd.to_timedelta(best[f"best_{prefix}_laptime"]).dt.total_seconds()
     best[f"best_{prefix}_rank"] = best[f"best_{prefix}_laptime_sec"].rank(method="dense")
     return best
+
+
+def _convert_timedelta_columns(df: pd.DataFrame, columns: List[str], suffix: str = "_sec") -> pd.DataFrame:
+    result = df.copy()
+    for col in columns:
+        if col in result:
+            result[f"{col}{suffix}"] = pd.to_timedelta(result[col]).dt.total_seconds()
+    return result
 
 
 def _maybe_merge_session_best_laps(
@@ -158,6 +190,126 @@ def _maybe_merge_long_run_features(
     return features.merge(long_run_df, on="DriverNumber", how="left")
 
 
+def _merge_on_driver(features: pd.DataFrame, addon: pd.DataFrame) -> pd.DataFrame:
+    for key in ("DriverId", "DriverNumber", "Abbreviation"):
+        if key in features.columns and key in addon.columns:
+            return features.merge(addon, on=key, how="left")
+    return features
+
+
+def _prev_year_quali_features(prev_dir: Path) -> Optional[pd.DataFrame]:
+    q_results = _load_session_parquet(prev_dir, "Q", "results")
+    if q_results is None:
+        return None
+    cols = [
+        col
+        for col in (
+            "DriverId",
+            "DriverNumber",
+            "Abbreviation",
+            "Position",
+            "Q1",
+            "Q2",
+            "Q3",
+        )
+        if col in q_results.columns
+    ]
+    data = q_results[cols].copy()
+    data = _convert_timedelta_columns(data, [c for c in ("Q1", "Q2", "Q3") if c in data], suffix="_sec")
+    rename_map = {"Position": "prev_year_quali_position"}
+    for col in ("Q1", "Q2", "Q3"):
+        if col in data.columns:
+            rename_map[col] = f"prev_year_{col.lower()}"
+            rename_map[f"{col}_sec"] = f"prev_year_{col.lower()}_sec"
+    data = data.rename(columns=rename_map)
+    return data
+
+
+def _prev_year_race_features(prev_dir: Path, session_code: str, prefix: str) -> Optional[pd.DataFrame]:
+    laps = _load_session_parquet(prev_dir, session_code, "laps")
+    if laps is None or "LapTime" not in laps:
+        return None
+
+    df = _prepare_valid_laps(laps)
+    if df.empty:
+        return None
+
+    for col in ("Sector1Time", "Sector2Time", "Sector3Time"):
+        if col in df:
+            df[f"{col}_sec"] = pd.to_timedelta(df[col]).dt.total_seconds()
+
+    agg = df.groupby("DriverNumber").agg(
+        lap_mean=("lap_seconds", "mean"),
+        lap_min=("lap_seconds", "min"),
+        sector1_mean=("Sector1Time_sec", "mean"),
+        sector2_mean=("Sector2Time_sec", "mean"),
+        sector3_mean=("Sector3Time_sec", "mean"),
+    )
+
+    agg = agg.rename(
+        columns={
+            "lap_mean": f"prev_{prefix}_lap_mean",
+            "lap_min": f"prev_{prefix}_lap_best",
+            "sector1_mean": f"prev_{prefix}_sector1_mean",
+            "sector2_mean": f"prev_{prefix}_sector2_mean",
+            "sector3_mean": f"prev_{prefix}_sector3_mean",
+        }
+    ).reset_index()
+    return agg
+
+
+def _inject_prev_year_features(features: pd.DataFrame, season: int, base_dir: Path) -> pd.DataFrame:
+    event_slug = _event_slug_from_dir(base_dir)
+    prev_dir = _find_prev_season_dir(event_slug, season)
+    if prev_dir is None:
+        return features
+
+    prev_q = _prev_year_quali_features(prev_dir)
+    if prev_q is not None:
+        features = _merge_on_driver(features, prev_q)
+
+    prev_race = _prev_year_race_features(prev_dir, "R", "race")
+    if prev_race is not None:
+        features = features.merge(prev_race, on="DriverNumber", how="left")
+
+    prev_sr = _prev_year_race_features(prev_dir, "SR", "sprint")
+    if prev_sr is not None:
+        features = features.merge(prev_sr, on="DriverNumber", how="left")
+
+    return features
+
+
+def _inject_standings_features(features: pd.DataFrame, season: int, round_number: int) -> pd.DataFrame:
+    snapshot = build_standings(season, round_number)
+
+    driver_key = "DriverId" if "DriverId" in features else "Abbreviation"
+    team_key = "TeamName" if "TeamName" in features else None
+
+    if driver_key:
+        features["champ_points_to_date"] = (
+            features[driver_key].map(snapshot.driver_points).astype("Float64")
+        )
+        features["champ_position"] = (
+            features[driver_key].map(snapshot.driver_positions).astype("Float64")
+        )
+    else:
+        features["champ_points_to_date"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+        features["champ_position"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+
+    if team_key:
+        features["team_points_to_date"] = (
+            features[team_key].map(snapshot.team_points).astype("Float64")
+        )
+        features["team_champ_position"] = (
+            features[team_key].map(snapshot.team_positions).astype("Float64")
+        )
+    else:
+        features["team_points_to_date"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+        features["team_champ_position"] = pd.Series([pd.NA] * len(features), dtype="Float64")
+
+    return features
+
+
 def _ensure_optional_session_columns(features: pd.DataFrame) -> pd.DataFrame:
     if features.empty:
         return features
@@ -195,6 +347,7 @@ def _ensure_optional_session_columns(features: pd.DataFrame) -> pd.DataFrame:
 def build_basic_weekend_features(season: int, round_number: int) -> Path:
     """Combine session aggregates into a basic feature table."""
     base_dir = _find_weekend_dir(season, round_number)
+    event_slug = _event_slug_from_dir(base_dir)
     q_laps = _load_session_parquet(base_dir, "Q", "laps")
     q_results = _load_session_parquet(base_dir, "Q", "results")
     if q_laps is None or q_results is None:
@@ -246,6 +399,11 @@ def build_basic_weekend_features(season: int, round_number: int) -> Path:
     for session_code, prefix in LONG_RUN_SESSIONS.items():
         features = _maybe_merge_long_run_features(features, base_dir, session_code, prefix)
 
+    features = _inject_prev_year_features(features, season, base_dir)
+    features = _inject_standings_features(features, season, round_number)
+    weather = get_weather_features(event_slug, season, round_number)
+    for key, value in weather.items():
+        features[key] = value
     features = _ensure_optional_session_columns(features)
 
     if "race_position" in features:
